@@ -1,4 +1,21 @@
-"""Viscosity and external forcing closures for the incompressible FSI solver."""
+"""
+    TransportConstitutive
+
+Constitutive closures used by momentum and resource transport.
+
+The numerical operators consume already evaluated coefficient or source fields.
+This module therefore separates material modelling from finite-difference
+geometry and from time integration.
+
+The viscosity and diffusivity values returned here are the coefficients that
+appear directly in the equations being solved. A nondimensional caller may,
+for example, include factors such as `1/Re` or `1/Pe` when constructing the
+corresponding model.
+
+No clipping of the phase indicator or resource field is performed. If a model
+produces a non-positive transport coefficient, the evaluator reports an error
+instead of silently modifying the state.
+"""
 module TransportConstitutive
 
 using ..MeshGeneration
@@ -9,13 +26,25 @@ export AbstractViscosityModel,
        HarmonicPhaseViscosity,
        viscosity_active,
        viscosity_field!,
+       AbstractDiffusivityModel,
+       NoDiffusion,
+       ConstantDiffusivity,
+       HarmonicPhaseDiffusivity,
+       diffusion_active,
+       diffusivity_field!,
+       AbstractResourceConsumption,
+       NoResourceConsumption,
+       SaturatingResourceConsumption,
+       resource_sink!,
        AbstractBodyForce,
        NoBodyForce,
        ConstantBodyForce,
        KolmogorovBodyForce,
        body_force!
 
+# ==============================================================================
 # COMMON VALIDATION
+# ==============================================================================
 
 function _validate_center_field(field, metrics::MeshMetrics, name::AbstractString)
     expected = (metrics.Nx, metrics.Ny)
@@ -42,15 +71,21 @@ function _validate_positive_field(field, name::AbstractString)
     return nothing
 end
 
+# ==============================================================================
 # VISCOSITY
+# ==============================================================================
 
 """Abstract supertype for effective viscosity closures."""
 abstract type AbstractViscosityModel end
 
-"""No viscous stress."""
+"""No viscous stress. The implicit momentum operator is skipped."""
 struct NoViscosity <: AbstractViscosityModel end
 
-"""Spatially constant positive effective viscosity coefficient."""
+"""
+    ConstantViscosity(value)
+
+Spatially constant positive effective viscosity coefficient.
+"""
 struct ConstantViscosity{T<:Real} <: AbstractViscosityModel
     value::T
 
@@ -61,7 +96,22 @@ struct ConstantViscosity{T<:Real} <: AbstractViscosityModel
     end
 end
 
-"""Harmonic interpolation of phase viscosities."""
+raw"""
+    HarmonicPhaseViscosity(fluid_value, structure_value)
+
+Harmonic interpolation between two positive phase viscosities,
+
+\mu(\phi)
+=
+\left[
+\frac{1-\phi}{\mu_f}
++
+\frac{\phi}{\mu_s}
+\right]^{-1}.
+
+For `fluid_value = 1` and `structure_value = ratio_mu`, this reduces to the
+viscosity law used in the inherited implementation.
+"""
 struct HarmonicPhaseViscosity{TF<:Real,TS<:Real} <: AbstractViscosityModel
     fluid_value::TF
     structure_value::TS
@@ -101,6 +151,10 @@ function viscosity_field!(output, model::HarmonicPhaseViscosity, phi, metrics::M
 
     # The phase fraction is physically meaningful on [0,1].  Conservative
     # interface schemes can produce roundoff/stage-level excursions just
+    # outside that interval; with very large property ratios, extrapolating
+    # the harmonic law through such excursions can create a non-positive
+    # effective viscosity.  Limit only the constitutive evaluation -- the
+    # transported phase field itself is left untouched.
     @inbounds for idx in eachindex(output, phi)
         p = clamp(Float64(phi[idx]), 0.0, 1.0)
         output[idx] = 1.0 / ((1.0 - p) / mu_f + p / mu_s)
@@ -110,7 +164,143 @@ function viscosity_field!(output, model::HarmonicPhaseViscosity, phi, metrics::M
     return output
 end
 
+# ==============================================================================
+# DIFFUSIVITY
+# ==============================================================================
+
+"""Abstract supertype for effective resource-diffusivity closures."""
+abstract type AbstractDiffusivityModel end
+
+"""No resource diffusion. The implicit scalar diffusion operator is skipped."""
+struct NoDiffusion <: AbstractDiffusivityModel end
+
+"""Spatially constant positive effective diffusivity coefficient."""
+struct ConstantDiffusivity{T<:Real} <: AbstractDiffusivityModel
+    value::T
+
+    function ConstantDiffusivity(value::T) where {T<:Real}
+        isfinite(value) || throw(ArgumentError("Diffusivity must be finite."))
+        value > zero(T) || throw(ArgumentError("Diffusivity must be strictly positive."))
+        return new{T}(value)
+    end
+end
+
+raw"""
+    HarmonicPhaseDiffusivity(fluid_value, structure_value)
+
+Harmonic interpolation between positive fluid and structural diffusivities,
+
+D(\phi)
+=
+\left[
+\frac{1-\phi}{D_f}
++
+\frac{\phi}{D_s}
+\right]^{-1}.
+"""
+struct HarmonicPhaseDiffusivity{TF<:Real,TS<:Real} <: AbstractDiffusivityModel
+    fluid_value::TF
+    structure_value::TS
+
+    function HarmonicPhaseDiffusivity(fluid_value::TF, structure_value::TS) where {TF<:Real,TS<:Real}
+        isfinite(fluid_value) || throw(ArgumentError("Fluid diffusivity must be finite."))
+        isfinite(structure_value) || throw(ArgumentError("Structure diffusivity must be finite."))
+        fluid_value > zero(TF) || throw(ArgumentError("Fluid diffusivity must be strictly positive."))
+        structure_value > zero(TS) || throw(ArgumentError("Structure diffusivity must be strictly positive."))
+        return new{TF,TS}(fluid_value, structure_value)
+    end
+end
+
+diffusion_active(::NoDiffusion) = false
+diffusion_active(::AbstractDiffusivityModel) = true
+
+function diffusivity_field!(output, ::NoDiffusion, phi, metrics::MeshMetrics)
+    _validate_output_shape(output, metrics, "diffusivity output")
+    _validate_center_field(phi, metrics, "phi")
+    fill!(output, 0.0)
+    return output
+end
+
+function diffusivity_field!(output, model::ConstantDiffusivity, phi, metrics::MeshMetrics)
+    _validate_output_shape(output, metrics, "diffusivity output")
+    _validate_center_field(phi, metrics, "phi")
+    fill!(output, Float64(model.value))
+    return output
+end
+
+function diffusivity_field!(output, model::HarmonicPhaseDiffusivity, phi, metrics::MeshMetrics)
+    _validate_output_shape(output, metrics, "diffusivity output")
+    _validate_center_field(phi, metrics, "phi")
+
+    D_f = Float64(model.fluid_value)
+    D_s = Float64(model.structure_value)
+    @. output = 1.0 / ((1.0 - phi) / D_f + phi / D_s)
+    _validate_positive_field(output, "evaluated diffusivity")
+    return output
+end
+
+# ==============================================================================
+# RESOURCE CONSUMPTION
+# ==============================================================================
+
+"""Abstract supertype for local resource-consumption laws."""
+abstract type AbstractResourceConsumption end
+
+"""No resource consumption: `C = 0`."""
+struct NoResourceConsumption <: AbstractResourceConsumption end
+
+raw"""
+    SaturatingResourceConsumption(rate, half_saturation)
+
+Local sink
+
+\mathcal{C}(\phi,c)
+=
+\phi\,c_{\max}\,\frac{c}{K_C+c}.
+
+The resource is used exactly as supplied; no clipping or denominator
+regularization is introduced here.
+"""
+struct SaturatingResourceConsumption{TR<:Real,TK<:Real} <: AbstractResourceConsumption
+    rate::TR
+    half_saturation::TK
+
+    function SaturatingResourceConsumption(rate::TR, half_saturation::TK) where {TR<:Real,TK<:Real}
+        isfinite(rate) || throw(ArgumentError("Consumption rate must be finite."))
+        isfinite(half_saturation) || throw(ArgumentError("Consumption half-saturation constant must be finite."))
+        rate >= zero(TR) || throw(ArgumentError("Consumption rate must be non-negative."))
+        half_saturation > zero(TK) || throw(ArgumentError(
+            "Consumption half-saturation constant must be strictly positive."
+        ))
+        return new{TR,TK}(rate, half_saturation)
+    end
+end
+
+function resource_sink!(output, ::NoResourceConsumption, phi, resource, metrics::MeshMetrics)
+    _validate_output_shape(output, metrics, "resource sink output")
+    _validate_center_field(phi, metrics, "phi")
+    _validate_center_field(resource, metrics, "resource")
+    fill!(output, 0.0)
+    return output
+end
+
+function resource_sink!(output, model::SaturatingResourceConsumption, phi, resource, metrics::MeshMetrics)
+    _validate_output_shape(output, metrics, "resource sink output")
+    _validate_center_field(phi, metrics, "phi")
+    _validate_center_field(resource, metrics, "resource")
+
+    rate = Float64(model.rate)
+    K = Float64(model.half_saturation)
+    @. output = rate * phi * resource / (K + resource)
+    all(isfinite, output) || throw(ArgumentError(
+        "Evaluated resource sink contains non-finite values."
+    ))
+    return output
+end
+
+# ==============================================================================
 # BODY FORCE
+# ==============================================================================
 
 """Abstract supertype for externally prescribed body-force models."""
 abstract type AbstractBodyForce end
@@ -118,7 +308,13 @@ abstract type AbstractBodyForce end
 """No externally prescribed body force."""
 struct NoBodyForce <: AbstractBodyForce end
 
-"""Spatially and temporally constant force components on the two momentum equations."""
+"""
+    ConstantBodyForce(fx, fy)
+
+Spatially and temporally constant force components on the two momentum
+equations. The supplied values are the coefficients that appear directly in
+the equations being solved.
+"""
 struct ConstantBodyForce{TX<:Real,TY<:Real} <: AbstractBodyForce
     fx::TX
     fy::TY
@@ -131,7 +327,16 @@ struct ConstantBodyForce{TX<:Real,TY<:Real} <: AbstractBodyForce
 end
 
 
-"""Steady streamwise Kolmogorov forcing f_x(y) = amplitude * sin(wavenumber*y + phase), f_y(y) = 0."""
+"""
+    KolmogorovBodyForce(amplitude, wavenumber; phase=0)
+
+Steady streamwise Kolmogorov forcing
+
+    f_x(y) = amplitude * sin(wavenumber*y + phase),
+    f_y(y) = 0.
+
+`amplitude` is the coefficient that appears directly in the momentum equation.
+"""
 struct KolmogorovBodyForce <: AbstractBodyForce
     amplitude::Float64
     wavenumber::Float64
