@@ -1,4 +1,34 @@
-"""Four-stage IMEX fractional-step method for incompressible Eulerian FSI."""
+raw"""
+    TimeIntegrationIMEX
+
+Four-stage IMEX fractional-step time integration for the one-velocity Eulerian
+FSI-growth formulation.
+
+The dynamic state contains only
+
+(\mathbf{v},\phi,c,\sigma).
+
+At every stage, the scalar growth source and growth tensor are algebraic fields
+constructed from the current stage state,
+
+G_s = \mathcal{G}(\phi_s,c_s),
+\qquad
+K_{g,s} = \mathcal{K}(G_s),
+
+and the velocity projection enforces
+
+\nabla_h\cdot\mathbf{v}_s = G_s.
+
+There is no auxiliary growth potential, expansion velocity, or second material
+velocity. The correction produced by the projection module is retained as a
+numerical correction potential `q`; this module does not identify it with the
+physical pressure without a separate pressure-recovery derivation.
+
+The explicit tableau is third order, while the implicit tableau used by the
+inherited algorithm is only second order. In addition, velocity is advanced by
+a fractional-step projection. The method is therefore documented here as a
+four-stage IMEX fractional-step scheme without claiming a global formal order.
+"""
 module TimeIntegrationIMEX
 
 using LinearAlgebra
@@ -10,12 +40,14 @@ using ..BoundaryConditions
 using ..Operators
 using ..Projection
 using ..MomentumTransport
+using ..ResourceTransport
 using ..InterfaceTransport
 using ..InterfaceRegularization
 using ..PhaseFieldMethods
 using ..Capillarity
 using ..StructuralConstitutive
 using ..StructureTensor
+using ..GrowthModels
 using ..TransportConstitutive
 
 export FSIState,
@@ -32,7 +64,9 @@ export FSIState,
        make_velocity_compatible!,
        integrate_step!
 
+# ==============================================================================
 # TIME TABLEAU
+# ==============================================================================
 
 """Marker type for the inherited four-stage IMEX fractional-step tableau."""
 struct FourStageIMEXFractionalStep end
@@ -55,37 +89,76 @@ const STAGE_ABSCISSA = (0.0, 8 / 15, 2 / 3, 1.0)
 const NSTAGES = 4
 const NHISTORY = 3
 
+# ==============================================================================
 # PUBLIC DATA STRUCTURES
+# ==============================================================================
 
-"""MAC velocity, phase indicator, and symmetric structural tensor."""
+"""
+    FSIState(U, V, phi, resource, sigma_xx, sigma_yy, sigma_xy)
+
+Dynamic variables advanced by the time integrator. All arrays are stored as
+`Float64` matrices. `U` and `V` are the full MAC velocity arrays; the remaining
+fields are cell centred.
+"""
 mutable struct FSIState
     U::Matrix{Float64}
     V::Matrix{Float64}
     phi::Matrix{Float64}
+    resource::Matrix{Float64}
     sigma_xx::Matrix{Float64}
     sigma_yy::Matrix{Float64}
     sigma_xy::Matrix{Float64}
 end
 
-"""Boundary conditions for velocity, projection potential, interface and tensor."""
-struct FSIBoundaryConditions{BU,BV,BQ,BP,BS}
+# Backward compatibility: the 6-array state used by the FTaC benchmarks has
+# no transported resource. It is initialized to zero; this state is only
+# suitable for configurations without resource-dependent growth.
+function FSIState(U, V, phi, sigma_xx, sigma_yy, sigma_xy)
+    return FSIState(U, V, phi, zeros(Float64, size(phi)), sigma_xx, sigma_yy, sigma_xy)
+end
+
+"""
+    FSIBoundaryConditions(U, V, correction, phi, resource, sigma)
+
+Boundary conditions consumed by the one-velocity solver. `correction` refers to
+the projection correction potential, not to a recovered physical pressure.
+`sigma` is a named tuple with fields `xx`, `yy`, and `xy`.
+"""
+struct FSIBoundaryConditions{BU,BV,BQ,BP,BC,BS}
     U::BU
     V::BV
     correction::BQ
     phi::BP
+    resource::BC
     sigma::BS
 
-    function FSIBoundaryConditions(U::BU, V::BV, correction::BQ, phi::BP, sigma::BS) where {BU,BV,BQ,BP,BS}
+    function FSIBoundaryConditions(U::BU, V::BV, correction::BQ, phi::BP, resource::BC, sigma::BS) where {BU,BV,BQ,BP,BC,BS}
         hasproperty(sigma, :xx) || throw(ArgumentError("sigma boundary data require an `xx` entry."))
         hasproperty(sigma, :yy) || throw(ArgumentError("sigma boundary data require a `yy` entry."))
         hasproperty(sigma, :xy) || throw(ArgumentError("sigma boundary data require an `xy` entry."))
-        return new{BU,BV,BQ,BP,BS}(U, V, correction, phi, sigma)
+        return new{BU,BV,BQ,BP,BC,BS}(U, V, correction, phi, resource, sigma)
     end
 end
 
-"""Constitutive and forcing models for incompressible flow and elasticity."""
-struct FSIModels{MU,TR,ES,CAP,PF,BF}
+# Backward compatibility: for no-resource FTaC cases, reuse the phase-field
+# boundary setup. For simulations transporting c, always specify its BCs
+# explicitly using the 6-argument constructor above.
+FSIBoundaryConditions(U, V, correction, phi, sigma) =
+    FSIBoundaryConditions(U, V, correction, phi, phi, sigma)
+
+"""
+    FSIModels(; kwargs...)
+
+Constitutive and forcing models coordinated by the time integrator. The default
+constructor represents a no-growth, inviscid, non-diffusive, non-reactive,
+non-elastic and non-capillary system.
+"""
+struct FSIModels{GS,GK,MU,DI,RC,TR,ES,CAP,PF,BF}
+    growth_source::GS
+    growth_tensor::GK
     viscosity::MU
+    diffusivity::DI
+    resource_consumption::RC
     tensor_relaxation::TR
     elastic_stress::ES
     capillarity::CAP
@@ -94,7 +167,11 @@ struct FSIModels{MU,TR,ES,CAP,PF,BF}
 end
 
 function FSIModels(;
+    growth_source = NoGrowth(),
+    growth_tensor = IsotropicGrowthTensor(),
     viscosity = NoViscosity(),
+    diffusivity = NoDiffusion(),
+    resource_consumption = NoResourceConsumption(),
     tensor_relaxation = NoRelaxation(),
     elastic_stress = NoElasticStress(),
     capillarity = NoCapillarity(),
@@ -102,24 +179,38 @@ function FSIModels(;
     interface_flux = NoInterfaceFlux(),
     body_force = NoBodyForce(),
 )
+    # Compatibility with the original `interface_flux` API. New configurations
+    # should select the complete operator through `phase_field_method`.
     pf_method = if phase_field_method === nothing
         LegacySplitPhaseFieldMethod(interface_flux)
     else
         interface_flux isa NoInterfaceFlux || throw(ArgumentError(
-            "Specify either phase_field_method or interface_flux, not both."
+            "Specify either phase_field_method or the legacy interface_flux keyword, not both."
         ))
         phase_field_method
     end
     pf_method isa AbstractPhaseFieldMethod || throw(ArgumentError(
         "phase_field_method must be an AbstractPhaseFieldMethod."
     ))
-    return FSIModels(viscosity, tensor_relaxation, elastic_stress,
-                     capillarity, pf_method, body_force)
+
+    return FSIModels(
+        growth_source,
+        growth_tensor,
+        viscosity,
+        diffusivity,
+        resource_consumption,
+        tensor_relaxation,
+        elastic_stress,
+        capillarity,
+        pf_method,
+        body_force,
+    )
 end
 
-"""Linear solver configuration for the implicit velocity systems."""
+"""Linear solver configuration for the stage velocity and resource systems."""
 struct LinearSolverOptions
     velocity_method::Symbol
+    resource_method::Symbol
     reltol::Float64
     maxiter::Int
     restart::Int
@@ -130,6 +221,7 @@ end
 
 function LinearSolverOptions(;
     velocity_method::Symbol = :direct,
+    resource_method::Symbol = :gmres,
     reltol::Real = 1e-8,
     maxiter::Integer = 800,
     restart::Integer = 100,
@@ -140,15 +232,33 @@ function LinearSolverOptions(;
     velocity_method in (:direct, :gmres) || throw(ArgumentError(
         "velocity_method must be :direct or :gmres."
     ))
+    resource_method in (:direct, :gmres) || throw(ArgumentError(
+        "resource_method must be :direct or :gmres."
+    ))
     reltol > 0 || throw(ArgumentError("Linear-solver reltol must be positive."))
     maxiter > 0 || throw(ArgumentError("Linear-solver maxiter must be positive."))
     restart > 0 || throw(ArgumentError("Linear-solver restart must be positive."))
     fallback_reltol > 0 || throw(ArgumentError("fallback_reltol must be positive."))
-    return LinearSolverOptions(velocity_method, Float64(reltol), Int(maxiter),
-        Int(restart), direct_fallback, Float64(fallback_reltol), verbose)
+    return LinearSolverOptions(
+        velocity_method,
+        resource_method,
+        Float64(reltol),
+        Int(maxiter),
+        Int(restart),
+        direct_fallback,
+        Float64(fallback_reltol),
+        verbose,
+    )
 end
 
-"""Numerical choices that are not constitutive physics."""
+"""
+    IMEXNumerics(; kwargs...)
+
+Numerical choices that are not constitutive physics. No phase clipping or FCT
+policy is hidden in this object. Phase-interface regularization is supplied
+through `FSIModels.phase_field_method`, while structural-tensor extension through
+the diffuse interface is supplied by `structure_extension`.
+"""
 struct IMEXNumerics{S,LS,SE}
     scheme::S
     linear_solvers::LS
@@ -200,46 +310,70 @@ struct IMEXContext{M,B,MO,N,P,VG}
     velocity_gradients::VG
 end
 
-"""Diagnostics accumulated over one complete IMEX step."""
+"""
+    StepReport
+
+Numerical diagnostics accumulated over one full IMEX step.
+"""
 struct StepReport
     maximum_projection_constraint_linf::Float64
+    maximum_growth_trace_error::Float64
     minimum_phi::Float64
     maximum_phi::Float64
+    minimum_resource::Float64
     minimum_sigma_eigenvalue::Float64
     maximum_abs_sigma_determinant_error::Float64
     non_spd_cells::Int
 end
 
+# ==============================================================================
 # WORKSPACE
+# ==============================================================================
 
 mutable struct IMEXWorkspace
+    # Time-n base state used by every stage.
     uv_n::Vector{Float64}
+    c_n::Vector{Float64}
     phi_n::Matrix{Float64}
     sigma_xx_n::Matrix{Float64}
     sigma_yy_n::Matrix{Float64}
     sigma_xy_n::Matrix{Float64}
 
+    # Current stage state and predictor vectors.
     U_stage::Matrix{Float64}
     V_stage::Matrix{Float64}
     phi_stage::Matrix{Float64}
+    c_stage::Matrix{Float64}
     sigma_xx_stage::Matrix{Float64}
     sigma_yy_stage::Matrix{Float64}
     sigma_xy_stage::Matrix{Float64}
     uv_stage::Vector{Float64}
     uv_predictor::Vector{Float64}
     rhs_uv::Vector{Float64}
+    rhs_c::Vector{Float64}
+    c_predictor::Vector{Float64}
 
+    # Stage histories required by stages 2:4.
     E_uv::Vector{Vector{Float64}}
     I_uv::Vector{Vector{Float64}}
+    E_c::Vector{Vector{Float64}}
+    I_c::Vector{Vector{Float64}}
     E_phi::Vector{Matrix{Float64}}
     E_sigma_xx::Vector{Matrix{Float64}}
     E_sigma_yy::Vector{Matrix{Float64}}
     E_sigma_xy::Vector{Matrix{Float64}}
 
-    # Fixed zero target for the incompressible projection and transport terms.
-    zero_divergence::Matrix{Float64}
+    # Algebraic fields shared consistently within a stage.
+    G::Matrix{Float64}
+    Kg_xx::Matrix{Float64}
+    Kg_xy::Matrix{Float64}
+    Kg_yx::Matrix{Float64}
+    Kg_yy::Matrix{Float64}
     viscosity::Matrix{Float64}
+    diffusivity::Matrix{Float64}
+    resource_sink::Matrix{Float64}
 
+    # Momentum and constitutive scratch fields.
     force_x::Matrix{Float64}
     force_y::Matrix{Float64}
     scratch_force_x::Matrix{Float64}
@@ -247,6 +381,8 @@ mutable struct IMEXWorkspace
     stress_xx::Matrix{Float64}
     stress_yy::Matrix{Float64}
     stress_xy::Matrix{Float64}
+
+    # Projection correction warm start.
     correction::Matrix{Float64}
 end
 
@@ -255,25 +391,58 @@ function allocate_imex_workspace(metrics::MeshMetrics)
     N = Nx * Ny
     return IMEXWorkspace(
         zeros(2N),
-        zeros(Nx, Ny), zeros(Nx, Ny), zeros(Nx, Ny), zeros(Nx, Ny),
-        zeros(Nx + 1, Ny), zeros(Nx, Ny + 1),
-        zeros(Nx, Ny), zeros(Nx, Ny), zeros(Nx, Ny), zeros(Nx, Ny),
-        zeros(2N), zeros(2N), zeros(2N),
+        zeros(N),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+
+        zeros(Nx + 1, Ny),
+        zeros(Nx, Ny + 1),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(2N),
+        zeros(2N),
+        zeros(2N),
+        zeros(N),
+        zeros(N),
+
         [zeros(2N) for _ in 1:NHISTORY],
         [zeros(2N) for _ in 1:NHISTORY],
+        [zeros(N) for _ in 1:NHISTORY],
+        [zeros(N) for _ in 1:NHISTORY],
         [zeros(Nx, Ny) for _ in 1:NHISTORY],
         [zeros(Nx, Ny) for _ in 1:NHISTORY],
         [zeros(Nx, Ny) for _ in 1:NHISTORY],
         [zeros(Nx, Ny) for _ in 1:NHISTORY],
-        zeros(Nx, Ny), zeros(Nx, Ny),
-        zeros(Nx + 1, Ny), zeros(Nx, Ny + 1),
-        zeros(Nx + 1, Ny), zeros(Nx, Ny + 1),
-        zeros(Nx, Ny), zeros(Nx, Ny), zeros(Nx, Ny),
+
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+
+        zeros(Nx + 1, Ny),
+        zeros(Nx, Ny + 1),
+        zeros(Nx + 1, Ny),
+        zeros(Nx, Ny + 1),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+        zeros(Nx, Ny),
+
         zeros(Nx, Ny),
     )
 end
 
+# ==============================================================================
 # CONTEXT CONSTRUCTION AND VALIDATION
+# ==============================================================================
 
 function _validate_periodicity(metrics::MeshMetrics, bcs::FSIBoundaryConditions)
     for (name, bc) in (
@@ -281,6 +450,7 @@ function _validate_periodicity(metrics::MeshMetrics, bcs::FSIBoundaryConditions)
         ("V", bcs.V),
         ("correction", bcs.correction),
         ("phi", bcs.phi),
+        ("resource", bcs.resource),
         ("sigma_xx", bcs.sigma.xx),
         ("sigma_yy", bcs.sigma.yy),
         ("sigma_xy", bcs.sigma.xy),
@@ -336,6 +506,7 @@ function _validate_state(state::FSIState, metrics::MeshMetrics)
 
     for (name, field) in (
         ("state.phi", state.phi),
+        ("state.resource", state.resource),
         ("state.sigma_xx", state.sigma_xx),
         ("state.sigma_yy", state.sigma_yy),
         ("state.sigma_xy", state.sigma_xy),
@@ -351,7 +522,9 @@ function _validate_state(state::FSIState, metrics::MeshMetrics)
     return nothing
 end
 
+# ==============================================================================
 # COMPACT MAC STORAGE HELPERS
+# ==============================================================================
 
 @inline _cell_index(i, j, Nx) = i + (j - 1) * Nx
 
@@ -404,6 +577,22 @@ function _inject_compact_predictor!(U, V, compact, metrics::MeshMetrics, bcs::FS
 
     return nothing
 end
+
+function _copy_cell_to_vector!(output, field)
+    length(output) == length(field) || throw(DimensionMismatch("Cell vector has incorrect length."))
+    copyto!(output, vec(field))
+    return output
+end
+
+function _copy_vector_to_cell!(field, input)
+    length(input) == length(field) || throw(DimensionMismatch("Cell vector has incorrect length."))
+    copyto!(vec(field), input)
+    return field
+end
+
+# ==============================================================================
+# LINEAR ALGEBRA HELPERS
+# ==============================================================================
 
 function _relative_residual(A, x, b)
     scale = max(norm(b), eps(Float64))
@@ -490,10 +679,13 @@ function _enforce_compact_dirichlet_values!(compact, metrics::MeshMetrics, bcs::
     return compact
 end
 
+# ==============================================================================
 # STAGE FIELD CONSTRUCTION
+# ==============================================================================
 
 function _copy_time_n_state!(work::IMEXWorkspace, state::FSIState, context::IMEXContext)
     _extract_compact_velocity!(work.uv_n, state.U, state.V, context.metrics)
+    _copy_cell_to_vector!(work.c_n, state.resource)
     copyto!(work.phi_n, state.phi)
     copyto!(work.sigma_xx_n, state.sigma_xx)
     copyto!(work.sigma_yy_n, state.sigma_yy)
@@ -513,6 +705,7 @@ function _set_stage_one!(work::IMEXWorkspace, state::FSIState)
     copyto!(work.U_stage, state.U)
     copyto!(work.V_stage, state.V)
     copyto!(work.phi_stage, work.phi_n)
+    _copy_vector_to_cell!(work.c_stage, work.c_n)
     copyto!(work.sigma_xx_stage, work.sigma_xx_n)
     copyto!(work.sigma_yy_stage, work.sigma_yy_n)
     copyto!(work.sigma_xy_stage, work.sigma_xy_n)
@@ -543,6 +736,40 @@ function _build_explicit_stage!(work::IMEXWorkspace, s::Int, dt::Float64, contex
         work.sigma_xy_stage,
         work.phi_stage,
     )
+    return nothing
+end
+
+function _build_resource_stage!(work::IMEXWorkspace, s::Int, dt::Float64, context::IMEXContext, diffusion_operator)
+    copyto!(work.rhs_c, work.c_n)
+    for j in 1:(s - 1)
+        a_exp = Float64(A_EXPLICIT[s][j])
+        a_imp = Float64(A_IMPLICIT[s][j])
+        if a_exp != 0.0 || a_imp != 0.0
+            @. work.rhs_c += dt * (a_exp * work.E_c[j] + a_imp * work.I_c[j])
+        end
+    end
+
+    if diffusion_operator === nothing
+        _copy_vector_to_cell!(work.c_stage, work.rhs_c)
+        return nothing
+    end
+
+    a_ss = Float64(A_IMPLICIT[s][s])
+    alpha = dt * a_ss
+    @. work.rhs_c += alpha * diffusion_operator.boundary
+    lhs = _shifted_identity(diffusion_operator.matrix, alpha)
+
+    options = context.numerics.linear_solvers
+    _solve_linear_system!(
+        work.c_predictor,
+        lhs,
+        work.rhs_c,
+        work.c_n,
+        options,
+        options.resource_method,
+        "resource stage $s",
+    )
+    _copy_vector_to_cell!(work.c_stage, work.c_predictor)
     return nothing
 end
 
@@ -595,7 +822,7 @@ function _build_velocity_stage!(work::IMEXWorkspace, s::Int, dt::Float64, contex
     result = project!(
         work.U_stage,
         work.V_stage,
-        work.zero_divergence,
+        work.G,
         context.projection_system,
         context.metrics;
         correction_guess=work.correction,
@@ -608,7 +835,49 @@ function _build_velocity_stage!(work::IMEXWorkspace, s::Int, dt::Float64, contex
     return result
 end
 
+# ==============================================================================
 # STAGE CONSTITUTIVE FIELDS
+# ==============================================================================
+
+function _evaluate_growth!(work::IMEXWorkspace, context::IMEXContext)
+    growth_source!(
+        work.G,
+        context.models.growth_source,
+        work.phi_stage,
+        work.c_stage,
+    )
+    growth_tensor!(
+        work.Kg_xx,
+        work.Kg_xy,
+        work.Kg_yx,
+        work.Kg_yy,
+        context.models.growth_tensor,
+        work.G,
+    )
+    diagnostics = growth_diagnostics(
+        work.G,
+        work.Kg_xx,
+        work.Kg_xy,
+        work.Kg_yx,
+        work.Kg_yy,
+    )
+    return diagnostics.maximum_trace_error
+end
+
+function _build_diffusion_operator!(work::IMEXWorkspace, context::IMEXContext)
+    diffusivity_field!(
+        work.diffusivity,
+        context.models.diffusivity,
+        work.phi_stage,
+        context.metrics,
+    )
+    diffusion_active(context.models.diffusivity) || return nothing
+    return build_diffusion_operator(
+        context.metrics,
+        work.diffusivity,
+        context.bcs.resource,
+    )
+end
 
 function _build_viscous_operator!(work::IMEXWorkspace, context::IMEXContext)
     viscosity_field!(
@@ -627,7 +896,9 @@ function _build_viscous_operator!(work::IMEXWorkspace, context::IMEXContext)
     )
 end
 
+# ==============================================================================
 # EXPLICIT AND IMPLICIT STAGE TENDENCIES
+# ==============================================================================
 
 function _accumulate_elastic_force!(work::IMEXWorkspace, context::IMEXContext)
     tau_xx, tau_yy, tau_xy = elastic_stress(
@@ -652,22 +923,43 @@ function _accumulate_elastic_force!(work::IMEXWorkspace, context::IMEXContext)
     return nothing
 end
 
+function _accumulate_growth_viscous_force!(work::IMEXWorkspace, context::IMEXContext)
+    viscosity_active(context.models.viscosity) || return nothing
+
+    @. work.stress_xx = -2.0 * work.viscosity * work.Kg_xx
+    @. work.stress_yy = -2.0 * work.viscosity * work.Kg_yy
+    @. work.stress_xy = -work.viscosity * (work.Kg_xy + work.Kg_yx)
+
+    Fx, Fy = symmetric_stress_divergence(
+        work.stress_xx,
+        work.stress_yy,
+        work.stress_xy,
+        context.metrics,
+    )
+    work.force_x .+= Fx
+    work.force_y .+= Fy
+    return nothing
+end
+
 function _evaluate_stage_tendencies!(
     work::IMEXWorkspace,
     s::Int,
     t_stage::Float64,
     context::IMEXContext,
     viscous_operator,
+    diffusion_operator,
 )
     metrics = context.metrics
     bcs = context.bcs
     models = context.models
 
+    # ------------------------------------------------------------------
     # Momentum explicit terms.
+    # ------------------------------------------------------------------
     Cu, Cv = material_convection(
         work.U_stage,
         work.V_stage,
-        work.zero_divergence,
+        work.G,
         metrics,
         bcs.U,
         bcs.V,
@@ -690,26 +982,63 @@ function _evaluate_stage_tendencies!(
     work.force_y .+= Fy_cap
 
     _accumulate_elastic_force!(work, context)
+    _accumulate_growth_viscous_force!(work, context)
     _extract_compact_velocity!(work.E_uv[s], work.force_x, work.force_y, metrics)
 
+    # ------------------------------------------------------------------
     # Interface transport.
+    # ------------------------------------------------------------------
     work.E_phi[s] .= phase_field_rhs(
         models.phase_field_method,
         work.U_stage,
         work.V_stage,
         work.phi_stage,
-        work.zero_divergence,
+        work.G,
         metrics,
         bcs.phi,
     )
 
+    # ------------------------------------------------------------------
+    # Resource transport and consumption.
+    # ------------------------------------------------------------------
+    if models.growth_source isa NoGrowth &&
+       models.diffusivity isa NoDiffusion &&
+       models.resource_consumption isa NoResourceConsumption
+        # Resource is absent from the original FTaC system. Avoid imposing
+        # scalar inflow BCs on a field that has no physical role in that case.
+        fill!(work.E_c[s], 0.0)
+    else
+        resource_sink!(
+            work.resource_sink,
+            models.resource_consumption,
+            work.phi_stage,
+            work.c_stage,
+            metrics,
+        )
+        E_c_matrix = resource_explicit_rhs(
+            work.U_stage,
+            work.V_stage,
+            work.c_stage,
+            work.resource_sink,
+            metrics,
+            bcs.resource,
+        )
+        _copy_cell_to_vector!(work.E_c[s], E_c_matrix)
+    end
+
+    # ------------------------------------------------------------------
     # Structural tensor.
+    # ------------------------------------------------------------------
     rhs_xx, rhs_yy, rhs_xy = structure_tensor_rhs(
         work.sigma_xx_stage,
         work.sigma_yy_stage,
         work.sigma_xy_stage,
         work.U_stage,
         work.V_stage,
+        work.Kg_xx,
+        work.Kg_xy,
+        work.Kg_yx,
+        work.Kg_yy,
         models.tensor_relaxation,
         metrics,
         bcs.sigma,
@@ -722,30 +1051,52 @@ function _evaluate_stage_tendencies!(
     copyto!(work.E_sigma_yy[s], rhs_yy)
     copyto!(work.E_sigma_xy[s], rhs_xy)
 
+    # ------------------------------------------------------------------
     # Implicit histories evaluated on the projected stage state.
+    # ------------------------------------------------------------------
     if viscous_operator === nothing
         fill!(work.I_uv[s], 0.0)
     else
         work.I_uv[s] .= apply_operator(viscous_operator, work.uv_stage)
     end
 
+    if diffusion_operator === nothing
+        fill!(work.I_c[s], 0.0)
+    else
+        _copy_cell_to_vector!(work.rhs_c, work.c_stage)
+        work.I_c[s] .= apply_operator(diffusion_operator, work.rhs_c)
+    end
+
     return nothing
 end
 
+# ==============================================================================
 # CONSTRAINT INITIALIZATION
+# ==============================================================================
 
-"""Project the initial MAC velocity onto the incompressible constraint."""
+raw"""
+    make_velocity_compatible!(state, context, workspace)
+
+Evaluate the growth source from the current `phi` and resource fields and
+project the supplied velocity onto
+
+\nabla_h\cdot\mathbf{v}=G.
+
+This operation is intended for simulation initialization. The projected
+velocity is written directly into `state`.
+"""
 function make_velocity_compatible!(
     state::FSIState,
     context::IMEXContext,
     work::IMEXWorkspace,
 )
     _validate_state(state, context.metrics)
+    growth_source!(work.G, context.models.growth_source, state.phi, state.resource)
 
     result = project!(
         state.U,
         state.V,
-        work.zero_divergence,
+        work.G,
         context.projection_system,
         context.metrics;
         correction_guess=work.correction,
@@ -758,26 +1109,46 @@ function make_velocity_compatible!(
 end
 
 function _stage_one_constraint_linf(work::IMEXWorkspace, context::IMEXContext)
-    residual = divergence(work.U_stage, work.V_stage, context.metrics) .- work.zero_divergence
+    residual = divergence(work.U_stage, work.V_stage, context.metrics) .- work.G
     return maximum(abs, residual)
 end
 
 function _check_stage_one_constraint!(linf::Float64, work::IMEXWorkspace, context::IMEXContext)
     context.numerics.check_stage1_constraint || return nothing
-    scale = 1.0
+    scale = max(maximum(abs, work.G), 1.0)
     tolerance = context.numerics.stage1_constraint_atol +
                 context.numerics.stage1_constraint_rtol * scale
     linf <= tolerance || throw(ArgumentError(
         "The velocity entering stage 1 does not satisfy the prescribed divergence constraint. " *
-        "Maximum |div(v)| = $linf, tolerance = $tolerance. " *
+        "Maximum |div(v)-G| = $linf, tolerance = $tolerance. " *
         "Initialize the state with make_velocity_compatible! or provide a compatible velocity."
     ))
     return nothing
 end
 
+# ==============================================================================
 # MAIN INTEGRATION STEP
+# ==============================================================================
 
-"""Advance incompressible velocity, phase indicator and structural tensor."""
+"""
+    integrate_step!(state, t, dt, context, workspace)
+
+Advance `state` from `t` to `t + dt` with the four-stage IMEX fractional-step
+scheme.
+
+For stages `s > 1`, the operation order is
+
+phi_s, sigma_s
+      -> resource implicit solve c_s
+      -> G_s
+      -> K_g,s
+      -> viscous velocity predictor
+      -> projection: div(v_s) = G_s
+      -> explicit/implicit stage tendencies.
+
+The same stage growth field `G_s` is used by projection, material momentum
+convection, interface transport, and growth kinematics.
+"""
 function integrate_step!(
     state::FSIState,
     t::Real,
@@ -798,6 +1169,7 @@ function integrate_step!(
     _copy_time_n_state!(work, state, context)
 
     maximum_projection_constraint_linf = 0.0
+    maximum_growth_trace_error = 0.0
 
     for s in 1:NSTAGES
         if s == 1
@@ -806,7 +1178,17 @@ function integrate_step!(
             _build_explicit_stage!(work, s, dt_f, context)
         end
 
-        # Viscosity is evaluated at the current interface stage.
+        # Resource state first: G_s may depend on c_s and must be known before
+        # the velocity projection.
+        diffusion_operator = _build_diffusion_operator!(work, context)
+        if s > 1
+            _build_resource_stage!(work, s, dt_f, context, diffusion_operator)
+        end
+
+        trace_error = _evaluate_growth!(work, context)
+        maximum_growth_trace_error = max(maximum_growth_trace_error, trace_error)
+
+        # Viscosity is evaluated from the same phi_s used to construct K_g,s.
         viscous_operator = _build_viscous_operator!(work, context)
 
         if s == 1
@@ -841,6 +1223,7 @@ function integrate_step!(
                 t_stage,
                 context,
                 viscous_operator,
+                diffusion_operator,
             )
         end
     end
@@ -849,6 +1232,7 @@ function integrate_step!(
     copyto!(state.U, work.U_stage)
     copyto!(state.V, work.V_stage)
     copyto!(state.phi, work.phi_stage)
+    copyto!(state.resource, work.c_stage)
     copyto!(state.sigma_xx, work.sigma_xx_stage)
     copyto!(state.sigma_yy, work.sigma_yy_stage)
     copyto!(state.sigma_xy, work.sigma_xy_stage)
@@ -861,8 +1245,10 @@ function integrate_step!(
 
     return StepReport(
         maximum_projection_constraint_linf,
+        maximum_growth_trace_error,
         minimum(state.phi),
         maximum(state.phi),
+        minimum(state.resource),
         sigma_diagnostics.minimum_eigenvalue,
         sigma_diagnostics.maximum_abs_determinant_error,
         sigma_diagnostics.non_spd_count,

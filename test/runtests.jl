@@ -225,3 +225,6 @@ end
     @test_throws ArgumentError PirozzoliUWCDIPhaseField(1.0; normal_reconstruction=:invalid)
     @test_throws ArgumentError JainACDIPhaseField(-1.0, 0.01)
 end
+
+
+include(joinpath(@__DIR__, "growth_tests.jl"))

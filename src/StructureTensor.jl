@@ -1,4 +1,41 @@
+raw"""
+    StructureTensor
 
+Finite-difference transport and evolution of a symmetric cell-centered
+structural tensor
+
+\sigma =
+\begin{pmatrix}
+\sigma_{xx} & \sigma_{xy}\\
+\sigma_{xy} & \sigma_{yy}
+\end{pmatrix}
+
+on the Eulerian MAC grid.
+
+The module implements the general kinematic equation
+
+\frac{D_v\sigma}{Dt}
+=
+L_e\sigma + \sigma L_e^T + \mathcal{R}(\sigma),
+\qquad
+L_e = \nabla v - K_g.
+
+`K_g` is supplied as a full two-dimensional tensor field and is not assumed to
+be isotropic or symmetric. Relaxation is delegated to `StructuralConstitutive`.
+The elastic stress and its divergence are deliberately separate from this
+transport equation.
+
+Advection uses first-order upwind conservative fluxes followed by the discrete
+identity
+
+-v\cdot\nabla q = -\nabla\cdot(vq) + q\,\nabla\cdot v.
+
+The module also provides numerical extension policies for `sigma` outside the
+structural region. These policies are deliberately separated from physical
+constitutive relaxation: they may contribute a phase-dependent extension RHS
+and/or a far-fluid safety reset. Diagnostics for loss of symmetric positive
+definiteness are provided separately.
+"""
 module StructureTensor
 
 using ..BoundaryConditions
@@ -15,7 +52,9 @@ export AbstractStructureExtension,
        apply_structure_extension!,
        structure_tensor_diagnostics
 
+# ==============================================================================
 # NUMERICAL EXTENSION POLICIES
+# ==============================================================================
 
 """Abstract supertype for numerical extension policies applied to `sigma`."""
 abstract type AbstractStructureExtension end
@@ -23,7 +62,14 @@ abstract type AbstractStructureExtension end
 """Leave the structural tensor unchanged outside the structural region."""
 struct NoStructureExtension <: AbstractStructureExtension end
 
-"""Reset `sigma` to the stress-free identity tensor wherever `phi < cutoff`."""
+"""
+    IdentityOutsideStructure(cutoff)
+
+Reset `sigma` to the stress-free identity tensor wherever `phi < cutoff`.
+This legacy hard-reset policy is retained for controlled ablations and backward
+compatibility. Definitive benchmark drivers use `GeometricStructureExtension`
+instead. It is not part of the constitutive evolution equation.
+"""
 struct IdentityOutsideStructure{T<:Real} <: AbstractStructureExtension
     cutoff::T
 
@@ -36,6 +82,27 @@ struct IdentityOutsideStructure{T<:Real} <: AbstractStructureExtension
     end
 end
 
+"""
+    GeometricStructureExtension(max_rate, exponent=4.0; safety_cutoff=1e-6)
+
+Smooth numerical extension regularisation for the structural tensor,
+
+`R_ext = -kappa(phi) * sigma * log(sigma)`,
+
+with
+
+`kappa(phi) = max_rate * (1 - clamp(phi, 0, 1))^exponent`.
+
+The regularisation vanishes in pure structure (`phi = 1`) and becomes
+progressively stronger as the structural phase disappears. For the continuous
+extension subproblem, `det(sigma)=1` is invariant and determinant errors relax
+toward one. The matrix logarithm is evaluated spectrally and therefore requires
+`sigma` to remain symmetric positive definite.
+
+`safety_cutoff` is an optional far-fluid safeguard only: when `phi` falls below
+this very small value, `sigma` is reset to the identity. It should not be used
+as a finite interfacial cutoff. Set it to zero to disable the safeguard.
+"""
 struct GeometricStructureExtension <: AbstractStructureExtension
     max_rate::Float64
     exponent::Float64
@@ -63,7 +130,9 @@ function GeometricStructureExtension(
     return GeometricStructureExtension(rate, power, cutoff)
 end
 
+# ==============================================================================
 # VALIDATION AND FIELD NORMALIZATION
+# ==============================================================================
 
 function _validate_center_field(field, metrics::MeshMetrics, name::AbstractString)
     expected = (metrics.Nx, metrics.Ny)
@@ -104,8 +173,20 @@ function _validate_tensor_boundaries(metrics::MeshMetrics, bc_sigma)
     return nothing
 end
 
+function _as_center_field(value, metrics::MeshMetrics, name::AbstractString)
+    if value isa Number
+        isfinite(value) || throw(ArgumentError("$name must be finite."))
+        return fill(Float64(value), metrics.Nx, metrics.Ny)
+    end
 
+    _validate_center_field(value, metrics, name)
+    all(isfinite, value) || throw(ArgumentError("$name must contain only finite values."))
+    return Float64.(value)
+end
+
+# ==============================================================================
 # FIRST-ORDER UPWIND MATERIAL ADVECTION
+# ==============================================================================
 
 @inline function _x_boundary_state(
     field,
@@ -261,15 +342,48 @@ function _conservative_upwind_advection(
     return rhs
 end
 
+# ==============================================================================
 # STRUCTURAL-TENSOR RHS
+# ==============================================================================
 
-"""Evaluate Eulerian structural-tensor transport."""
+raw"""
+    structure_tensor_rhs(
+        sigma_xx, sigma_yy, sigma_xy,
+        U, V,
+        Kg_xx, Kg_xy, Kg_yx, Kg_yy,
+        relaxation_model,
+        metrics, bc_sigma, bc_U, bc_V;
+        phi=nothing,
+        structure_extension=NoStructureExtension(),
+    )
+
+Evaluate the explicit structural-tensor right-hand side
+
+-v\cdot\nabla\sigma
++ (\nabla v-K_g)\sigma
++ \sigma(\nabla v-K_g)^T
++ \mathcal{R}(\sigma)
++ \mathcal{R}_{\mathrm{ext}}(\sigma,\phi).
+
+The constitutive relaxation `relaxation_model` is physical. The optional
+`structure_extension` is a numerical one-domain extension treatment and is
+evaluated only when `phi` is supplied.
+
+The four components of `K_g` may each be either a scalar or an `Nx × Ny`
+cell-centered field. `bc_sigma` is a named tuple with entries `xx`, `yy`, and
+`xy`, each containing a `BoundaryConditionSetup` for the corresponding tensor
+component.
+"""
 function structure_tensor_rhs(
     sigma_xx,
     sigma_yy,
     sigma_xy,
     U,
     V,
+    Kg_xx,
+    Kg_xy,
+    Kg_yx,
+    Kg_yy,
     relaxation_model::AbstractTensorRelaxation,
     metrics::MeshMetrics,
     bc_sigma,
@@ -283,6 +397,11 @@ function structure_tensor_rhs(
     _validate_center_field(sigma_xy, metrics, "sigma_xy")
     _validate_velocity_fields(U, V, metrics)
     _validate_tensor_boundaries(metrics, bc_sigma)
+
+    Kxx = _as_center_field(Kg_xx, metrics, "Kg_xx")
+    Kxy = _as_center_field(Kg_xy, metrics, "Kg_xy")
+    Kyx = _as_center_field(Kg_yx, metrics, "Kg_yx")
+    Kyy = _as_center_field(Kg_yy, metrics, "Kg_yy")
 
     adv_xx_cons = _conservative_upwind_advection(
         sigma_xx, U, V, metrics, bc_sigma.xx
@@ -301,10 +420,10 @@ function structure_tensor_rhs(
 
     du_dx, du_dy, dv_dx, dv_dy = velocity_gradient(U, V, metrics, bc_U, bc_V)
 
-    A11 = du_dx
-    A12 = du_dy
-    A21 = dv_dx
-    A22 = dv_dy
+    A11 = @. du_dx - Kxx
+    A12 = @. du_dy - Kxy
+    A21 = @. dv_dx - Kyx
+    A22 = @. dv_dy - Kyy
 
     deformation_xx = @. 2.0 * (A11 * sigma_xx + A12 * sigma_xy)
     deformation_yy = @. 2.0 * (A21 * sigma_xy + A22 * sigma_yy)
@@ -343,7 +462,9 @@ function structure_tensor_rhs(
            adv_xy .+ deformation_xy .+ relax_xy .+ ext_xy
 end
 
+# ==============================================================================
 # NUMERICAL EXTENSION
+# ==============================================================================
 
 function structure_extension_rhs(
     ::AbstractStructureExtension,
@@ -491,8 +612,18 @@ function apply_structure_extension!(
     return reset_count
 end
 
+# ==============================================================================
 # SPD DIAGNOSTICS
+# ==============================================================================
 
+"""
+    structure_tensor_diagnostics(sigma_xx, sigma_yy, sigma_xy)
+
+Return the minimum determinant, maximum absolute determinant error relative to
+unity, minimum eigenvalue, and the number of cells whose symmetric 2x2 tensor
+is not positive definite. This function is diagnostic only;
+it never modifies the tensor.
+"""
 function structure_tensor_diagnostics(sigma_xx, sigma_yy, sigma_xy)
     (size(sigma_xx) == size(sigma_yy) && size(sigma_yy) == size(sigma_xy)) || throw(DimensionMismatch(
         "sigma_xx, sigma_yy, and sigma_xy must have identical sizes."
@@ -527,6 +658,27 @@ function structure_tensor_diagnostics(sigma_xx, sigma_yy, sigma_xy)
         maximum_abs_determinant_error = maximum_abs_determinant_error,
         minimum_eigenvalue = minimum_eigenvalue,
         non_spd_count = non_spd_count,
+    )
+end
+
+
+# Legacy no-growth structure-tensor API (the original argument order).
+function structure_tensor_rhs(
+    sigma_xx, sigma_yy, sigma_xy,
+    U, V,
+    relaxation_model::AbstractTensorRelaxation,
+    metrics::MeshMetrics,
+    bc_sigma, bc_U, bc_V;
+    kwargs...,
+)
+    return structure_tensor_rhs(
+        sigma_xx, sigma_yy, sigma_xy,
+        U, V,
+        0.0, 0.0, 0.0, 0.0,
+        relaxation_model,
+        metrics,
+        bc_sigma, bc_U, bc_V;
+        kwargs...,
     )
 end
 

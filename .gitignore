@@ -1,0 +1,11 @@
+# Generated benchmark/simulation outputs
+outputs/
+
+# Julia / editor / OS artefacts
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
