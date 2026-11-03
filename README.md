@@ -85,12 +85,6 @@ Consequently, the original sealed/periodic benchmark domains cannot simply
 be run with everywhere-positive growth. Configure an open-flow problem or a
 compatible volume source and verify the boundary treatment before use.
 
-**Status:** This integration includes constitutive and discrete-projection
-checks, but does not yet establish grid/time convergence or physical validation
-of a complete nonzero-growth FSI benchmark. Do not interpret this extension
-as a numerically validated research result without such experiments.
-See [`GROWTH_INTEGRATION_NOTES.md`](GROWTH_INTEGRATION_NOTES.md).
-
 ### Tests
 
 ```bash
